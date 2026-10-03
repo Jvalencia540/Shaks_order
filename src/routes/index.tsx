@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
-import { MENU, addOrder, formatCOP, getOrders, type OrderItem } from "@/lib/shaks-store";
+import { useEffect, useMemo, useState } from "react";
+import { supabase } from "@/lib/supabase";
+import { formatCOP, type OrderItem } from "@/lib/shaks-store";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -16,22 +17,73 @@ export const Route = createFileRoute("/")({
   component: CajaPage,
 });
 
+interface Producto {
+  id: string;
+  nombre: string;
+  precio: number;
+  categoria: string;
+}
+
+interface PedidoActivo {
+  id: string;
+  beeper: number;
+  estado: string;
+}
+
 function CajaPage() {
+  const [menu, setMenu] = useState<Producto[]>([]);
+  const [pedidosActivos, setPedidosActivos] = useState<PedidoActivo[]>([]);
   const [cart, setCart] = useState<Map<string, number>>(new Map());
   const [beeper, setBeeper] = useState<number | null>(null);
   const [sent, setSent] = useState(false);
+  const [loadingMenu, setLoadingMenu] = useState(true);
+  const [sending, setSending] = useState(false);
 
+  // Cargar datos desde Supabase al montar el componente
+  useEffect(() => {
+    async function loadInitialData() {
+      try {
+        setLoadingMenu(true);
+
+        // 1. Obtener Menú desde Supabase
+        const { data: productosData } = await supabase
+          .from("productos")
+          .select("*")
+          .order("nombre", { ascending: true });
+
+        if (productosData) setMenu(productosData);
+
+        // 2. Obtener Pedidos Activos para deshabilitar Beepers ocupados
+        const { data: pedidosData } = await supabase
+          .from("pedidos")
+          .select("id, beeper, estado")
+          .neq("estado", "delivered");
+
+        if (pedidosData) setPedidosActivos(pedidosData);
+      } catch (err) {
+        console.error("Error al cargar datos de Supabase:", err);
+      } font-medium {
+        setLoadingMenu(false);
+      }
+    }
+
+    loadInitialData();
+  }, [sent]);
+
+  // Identificar beepers actualmente ocupados en la base de datos
   const occupiedBeepers = useMemo(
-    () => new Set(getOrders().filter((o) => o.status !== "delivered").map((o) => o.beeper)),
-    [sent]
+    () => new Set(pedidosActivos.map((p) => Number(p.beeper))),
+    [pedidosActivos]
   );
 
+  // Mapear el carrito con la información de precios traída de Supabase
   const items: OrderItem[] = [...cart.entries()]
     .filter(([, q]) => q > 0)
-    .map(([name, qty]) => {
-      const m = MENU.find((x) => x.name === name)!;
-      return { name, qty, price: m.price };
+    .map(([nombre, qty]) => {
+      const m = menu.find((x) => x.nombre === nombre);
+      return { name: nombre, qty, price: m ? Number(m.precio) : 0 };
     });
+
   const total = items.reduce((s, i) => s + i.price * i.qty, 0);
 
   const changeQty = (name: string, delta: number) => {
@@ -43,18 +95,45 @@ function CajaPage() {
     });
   };
 
-  const send = () => {
-    if (!beeper || items.length === 0) return;
-    addOrder(beeper, items);
-    setCart(new Map());
-    setBeeper(null);
-    setSent(true);
+  // Enviar Pedido Real a la tabla 'pedidos' de Supabase
+  const send = async () => {
+    if (!beeper || items.length === 0 || sending) return;
+
+    try {
+      setSending(true);
+
+      const payload = {
+        beeper,
+        items,
+        total,
+        estado: "pending",
+        created_at: new Date().toISOString(),
+      };
+
+      const { error } = await supabase.from("pedidos").insert([payload]);
+
+      if (error) {
+        console.error("Error al guardar pedido en Supabase:", error);
+        alert("Ocurrió un error al enviar el pedido a cocina.");
+        return;
+      }
+
+      setCart(new Map());
+      setBeeper(null);
+      setSent(true);
+    } catch (err) {
+      console.error("Error inesperado:", err);
+    } finally {
+      setSending(false);
+    }
   };
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-6">
       <h1 className="font-display text-3xl text-foreground sm:text-4xl">Toma de Pedidos</h1>
-      <p className="mt-1 text-lg text-muted-foreground">Toque los ítems para armar el pedido, asigne beeper y envíe a cocina.</p>
+      <p className="mt-1 text-lg text-muted-foreground">
+        Toque los ítems para armar el pedido, asigne beeper y envíe a cocina.
+      </p>
 
       {sent && (
         <div className="mt-4 rounded-2xl bg-accent px-5 py-4 text-xl font-bold text-accent-foreground">
@@ -63,32 +142,50 @@ function CajaPage() {
       )}
 
       <div className="mt-6 grid gap-6 lg:grid-cols-[1fr_360px]">
-        {/* Menú */}
+        {/* Menú Dinámico desde Supabase */}
         <section aria-label="Menú">
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-            {MENU.map((m) => {
-              const qty = cart.get(m.name) ?? 0;
-              return (
-                <button
-                  key={m.name}
-                  onClick={() => changeQty(m.name, 1)}
-                  className={`relative min-h-28 rounded-2xl border-4 p-4 text-left shadow-sm transition-transform active:scale-95 ${
-                    qty > 0 ? "border-primary bg-primary text-primary-foreground" : "border-border bg-card"
-                  }`}
-                >
-                  <span className="block text-lg font-bold leading-tight sm:text-xl">{m.name}</span>
-                  <span className={`mt-1 block text-base font-semibold ${qty > 0 ? "text-primary-foreground/90" : "text-muted-foreground"}`}>
-                    {formatCOP(m.price)}
-                  </span>
-                  {qty > 0 && (
-                    <span className="absolute right-3 top-3 grid h-9 w-9 place-items-center rounded-full bg-gold text-lg font-extrabold text-gold-foreground">
-                      {qty}
+          {loadingMenu ? (
+            <p className="py-10 text-center text-lg text-muted-foreground animate-pulse">
+              Cargando menú desde Supabase...
+            </p>
+          ) : menu.length === 0 ? (
+            <p className="py-10 text-center text-amber-600">
+              No hay productos registrados en la base de datos.
+            </p>
+          ) : (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              {menu.map((m) => {
+                const qty = cart.get(m.nombre) ?? 0;
+                return (
+                  <button
+                    key={m.id || m.nombre}
+                    onClick={() => changeQty(m.nombre, 1)}
+                    className={`relative min-h-28 rounded-2xl border-4 p-4 text-left shadow-sm transition-transform active:scale-95 ${
+                      qty > 0
+                        ? "border-primary bg-primary text-primary-foreground"
+                        : "border-border bg-card"
+                    }`}
+                  >
+                    <span className="block text-lg font-bold leading-tight sm:text-xl">
+                      {m.nombre}
                     </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
+                    <span
+                      className={`mt-1 block text-base font-semibold ${
+                        qty > 0 ? "text-primary-foreground/90" : "text-muted-foreground"
+                      }`}
+                    >
+                      {formatCOP(Number(m.precio))}
+                    </span>
+                    {qty > 0 && (
+                      <span className="absolute right-3 top-3 grid h-9 w-9 place-items-center rounded-full bg-gold text-lg font-extrabold text-gold-foreground">
+                        {qty}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </section>
 
         {/* Resumen + beeper + enviar */}
@@ -101,7 +198,10 @@ function CajaPage() {
             ) : (
               <ul className="space-y-1">
                 {items.map((i) => (
-                  <li key={i.name} className="flex items-center justify-between gap-2 text-base font-semibold">
+                  <li
+                    key={i.name}
+                    className="flex items-center justify-between gap-2 text-base font-semibold"
+                  >
                     <span className="min-w-0 truncate">
                       {i.qty}× {i.name}
                     </span>
@@ -141,8 +241,8 @@ function CajaPage() {
                       active
                         ? "bg-primary text-primary-foreground ring-4 ring-gold"
                         : busy
-                          ? "cursor-not-allowed bg-muted text-muted-foreground opacity-40"
-                          : "bg-secondary text-secondary-foreground"
+                        ? "cursor-not-allowed bg-muted text-muted-foreground opacity-40"
+                        : "bg-secondary text-secondary-foreground"
                     }`}
                   >
                     {n}
@@ -154,10 +254,10 @@ function CajaPage() {
 
           <button
             onClick={send}
-            disabled={!beeper || items.length === 0}
+            disabled={!beeper || items.length === 0 || sending}
             className="mt-1 min-h-20 rounded-2xl bg-primary text-2xl font-extrabold text-primary-foreground shadow-lg transition-transform enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            🚀 ENVIAR A COCINA
+            {sending ? "ENVIANDO..." : "🚀 ENVIAR A COCINA"}
           </button>
         </aside>
       </div>
